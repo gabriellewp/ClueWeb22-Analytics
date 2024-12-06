@@ -11,7 +11,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 from collections import Counter
 from huggingface_hub import HfApi, login
-
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
+from sklearn.cluster import KMeans
 
 def read_file_dynamic(file_path, start_line=0, num_lines=5):
     """
@@ -140,12 +141,65 @@ def extract_feature_list(jsonl_file_path=None, id_doc=False, content_doc=False):
         return ids
     else:
         raise ValueError("Either id_doc or content_doc must be True")
+    
+def load_model():
+    """
+    Loads a pre-trained model for causal language modeling.
 
+    Returns:
+        model (AutoModelForCausalLM): The loaded pre-trained model.
+    """
+
+    model_name = "Meta-Llama-3-8B-Instruct"
+    model_path = "/ivi/ilps/datasets/models/LLMs/Llama3.1/Meta-Llama-3.1-8B"
+    float16 = True
+    batch_size = 16
+    device_map= "auto"
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
+    quantization_config = bnb_config
+    model = AutoModel.from_pretrained(model_path, device_map=device_map, quantization_config=quantization_config)
+    model.generation_config.pad_token_id = model.generation_config.eos_token_id
+    return model
+
+def load_tokenizer():
+    """
+    Load and configure a tokenizer for the HF model.
+
+    Returns:
+        tokenizer (AutoTokenizer): The loaded and configured tokenizer.
+    """
+    
+    truncation= True
+    padding= True
+    padding_side= "left"
+    maximum_length = 60000
+    model_max_length = 60000
+    model_path = "/ivi/ilps/datasets/models/LLMs/Llama3.1/Meta-Llama-3.1-8B"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, truncation=truncation, padding=padding, padding_side=padding_side, maximum_length=maximum_length, model_max_length=model_max_length)
+    # tokenizer.chat_template = cfg.model.tokenizer_chat_template_HF   
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 def clustering_and_topic_extraction():
-    index_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/pyserini-index"  
-    searcher = SimpleSearcher(index_path)    
-    embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v1')
-    index_reader = IndexReader(index_path)
+    # index_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/pyserini-index"  
+    # searcher = SimpleSearcher(index_path)    
+    print("start clustering and topic extraction")
+    #working with senteceTransformer is incredibly slow and almost no progress, hence changing to AutoTokenizer
+    embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+    # print("done loading model")
+    
+    #using AutoTokenizer
+
+    # tokenizer = load_tokenizer()
+    # model = load_model()
+    # index_reader = IndexReader(index_path)
     #extracting doc embeddings
     # doc_ids = searcher.docids()
     # documents = [searcher.doc(doc_id).raw() for doc_id in doc_ids]
@@ -156,31 +210,48 @@ def clustering_and_topic_extraction():
     #replace the documents with raw string from dataset
     documents = extract_feature_list(content_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
     print("documents length", len(documents))
-    embeddings = embedding_model.encode(documents)
+    embeddings = embedding_model.encode(documents[0:2])
     
     print("done obtaining embeddings")
     #clustering with dbscan
-    dbscan = DBSCAN(eps=0.6, min_samples=1000, metric='cosine') 
-    clusters = dbscan.fit_predict(embeddings)
-    clustered_docs = {cluster_id: [] for cluster_id in set(clusters) if cluster_id != -1}
+    for eps_ in [0.4, 0.6, 0.8, 1.0]:
+        print('eps', eps_)
+        
+        #trying with dbscan
+        # dbscan = DBSCAN(eps=eps_, min_samples=2, metric='cosine') 
+        # clusters = dbscan.fit_predict(embeddings)
+        
+        #with kmeans
+        clusters = KMeans(n_clusters=2, random_state=0).fit_predict(embeddings)
+        
+        clustered_docs = {cluster_id: [] for cluster_id in set(clusters) if cluster_id != -1}
+        print("cluster length", len(clusters))
+        
+        #with faiss k-means and hierarchical clustering with faiss
+        # embeddings = np.array(embeddings)
     
-    #retrieve the document_ids 
-    ids = extract_feature_list(id_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
-    print("ids length", len(ids))
-    for doc, cluster_id in zip(ids, clusters):
-        if cluster_id != -1:  # Ignore noise (-1)
-            clustered_docs[cluster_id].append(ids)
-    print("done clustering")
-            
-    #display cluster result
-    for cluster_id, docs in clustered_docs.items():
-        print(f"\nCluster {cluster_id}:")
-        print(f" - Representative Keywords: {extract_keywords(docs)}")
-        for doc in docs[:3]:  
-            print(f"   - {doc[:200]}...")  
+        #retrieve the document_ids 
+        ids = extract_feature_list(id_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
+
+        ids = ids[0:2] #we want to test with only 2 documents for now
+        print("ids length", len(ids))
+        for doc, cluster_id in zip(ids, clusters):
+            print("cluster_id:", cluster_id)
+            if cluster_id != -1:  # Ignore noise (-1)
+                clustered_docs[cluster_id].append(ids)
+        print("done clustering")
+        print("length of clustered docs", len(clustered_docs))
+        #display cluster result
+        for cluster_id, docs in clustered_docs.items():
+            print("docs in clustered_docs", docs)
+            print(f"\nCluster {cluster_id}:")
+            print(f" - Representative Keywords: {extract_keywords(docs)}")
+            for doc in docs[:3]:  
+                print(f"   - {doc[:200]}...")  
         
 def extract_keywords(docs, top_n=5):
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
+    #using tfidf weights to extract topic for each cluster
+    vectorizer = TfidfVectorizer(max_features=5000)  
     tfidf_matrix = vectorizer.fit_transform(docs)
     feature_names = vectorizer.get_feature_names_out()
     tfidf_scores = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
@@ -213,7 +284,6 @@ def extract_keywords(docs, top_n=5):
 #     print(f"result {result}")
 
 def main():
-    login(token="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")
     # api = HfApi()
     # api.login(token="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")
     # file_path = '/ivi/ilps/datasets/clueweb22/disk1/txt/en/en00/en0000/en0000-00.json.gz'
@@ -242,6 +312,7 @@ def main():
     # index_collection(input_dir_path=input_dir_path, convert_pyserini=True, input_filename="msmarco-docs-id-contents.tsv", output_dir_path=output_dir_path)
     
     #cluster the pyserini index
+    print("clustering and topic extraction starting point")
     clustering_and_topic_extraction()
     
     #testing index reader
@@ -254,4 +325,22 @@ def main():
     # print("term positions: ", term_positions)
     
 if __name__ == "__main__":
-    main()
+    print("start here")
+    # hf_key = os.environ.get('HF_KEY')
+    # if not hf_key:
+    #     raise EnvironmentError("HF_KEY environment variable is not set")
+    # login(token=hf_key)
+    # main()
+    
+    # from datasets import load_dataset
+
+    # docs = load_dataset('irds/clueweb12', 'docs', trust_remote_code=True)
+    # # for record in docs:
+    # #     record # {'doc_id': ..., 'url': ..., 'date': ..., 'http_headers': ..., 'body': ..., 'body_content_type': ...}
+    from ClueWeb22Api import ClueWeb22Api
+    from ClueWeb22Api import AnnotateHtml_pb2
+    from ClueWeb22Api import AnnotateHtmlApi
+    cw22id = "clueweb22-en0000-00-00004"
+    root_path = "home/gpoerwa"
+    clueweb_api = ClueWeb22Api(cw22id, root_path)
+    clueweb_api.get_node_features_with_text(is_primary=True)
