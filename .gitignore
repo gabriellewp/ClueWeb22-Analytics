@@ -1,1 +1,3 @@
 output/
+sbatch_cpu.sh
+sbatch_gpu.sh
