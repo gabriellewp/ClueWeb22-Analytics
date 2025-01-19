@@ -127,7 +127,7 @@ def detect_topic_tags(directory_path):
                 print(f"Feature names: {feature_names}")
 
     
-def extract_feature_list(jsonl_file_path=None, feature_name=None):
+def extract_feature_list_jsonl(jsonl_file_path=None, feature_name=None):
     """
     Extracts the 'content' field from a .jsonl file and returns a list of content values.
     It can only be one of the two fields: 'id' or 'content'.
@@ -146,7 +146,28 @@ def extract_feature_list(jsonl_file_path=None, feature_name=None):
                 extracted_feature.append(data[feature_name])
     return extracted_feature
 
+def extract_feature_list_jsonl_gz(jsonl_gz_file_path=None, feature_name=None):
+    extracted_feature = []
+    with gzip.open(jsonl_gz_file_path, 'rt') as f:
+        for line in f:
+            data = json.loads(line)
+            if feature_name in data:
+                extracted_feature.append(data[feature_name])
+    return extracted_feature
+
+def extract_feature_list_tsv(tsv_file_path=None, col_number=None):
+    """
+    Extracts the content from the tsv file. Where the tsv file is usually dont have a header, we select the feature based on the column number. 
     
+    """
+    extracted_feature = []
+    with open(tsv_file_path, 'r', encoding='utf-8') as tsvfile:
+        reader = csv.reader(tsvfile, delimiter='\t')
+        for row in reader:
+            if col_number < len(row):
+                extracted_feature.append(row[col_number])
+    return extracted_feature
+
 def load_model():
     """
     Loads a pre-trained model for causal language modeling.
@@ -193,20 +214,88 @@ def load_tokenizer():
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
-                
-def faiss_clustering():
+def faiss_clustering_streaming():
     import faiss
     from scipy.cluster.hierarchy import linkage, dendrogram
     from scipy.cluster.hierarchy import fcluster
     from sklearn.cluster import KMeans
     from sklearn.decomposition import PCA
+    print("in a faiss_clustering_streaming function")
     d = 128
     n_clusters = 100
-    jsonl_file_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl"
-    documents = extract_feature_list(jsonl_file_path=jsonl_file_path, feature_name="contents")
-    ids = extract_feature_list(jsonl_file_path=jsonl_file_path, feature_name="id")
+    chunk_size = 100000  # number of documents to process at a time, in clueweb22 per json.gz file will contain 100000 documents records
+    directory_path = "/ivi/ilps/datasets/clueweb22/disk1/txt/en/"
+    
+    # initialized FAISS index with reduced dimensionality
+    index = faiss.IndexFlatL2(d)
+    
+    # initialize PCA
+    pca = PCA(n_components=d)
+    
+    # intialize the embedding model
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    embeddings = embedding_model.encode(documents[0:4000])
+    
+    # initialize lists to store document IDs and cluster assignments
+    all_ids = []
+    all_cluster_assignments = []
+    # List all .json.gz files in the directory
+    json_gz_files = glob.glob(os.path.join(directory_path, '**', '*.json.gz'), recursive=True)
+    print("length of json_gz_files", len(json_gz_files))
+    for file_path in json_gz_files:
+        documents = extract_feature_list_jsonl_gz(jsonl_gz_file_path=file_path, feature_name="Clean-Text")
+        ids = extract_feature_list_jsonl_gz(jsonl_gz_file_path=file_path, feature_name="ClueWeb22-ID")
+        
+        if not documents:
+            break
+        print(f"Processing {file_path} and number of documents: {len(documents)}")
+        embeddings = embedding_model.encode(documents)
+        reduced_embeddings = pca.fit_transform(embeddings)
+        index.add(reduced_embeddings)
+        all_ids.extend(ids)
+    
+    # Perform clustering using KMeans
+    kmeans = faiss.Kmeans(d, n_clusters, niter=20, verbose=True)
+    
+    # Retrieve all vectors stored in the index
+    vectors = index.reconstruct_n(0, index.ntotal)
+    
+    # Train the KMeans model using the retrieved vectors
+    kmeans.train(vectors)
+    
+    # Get the cluster assignments for each vector
+    cluster_assignments = kmeans.index.search(vectors, 1)[1].flatten()
+    
+    # Initialize a dictionary to hold documents per cluster
+    clustered_docs = {i: [] for i in range(n_clusters)}
+    
+    # Assign documents to clusters
+    for doc_id, cluster_id in zip(all_ids, cluster_assignments):
+        clustered_docs[cluster_id].append(doc_id)
+    
+    print("Clustered documents:", clustered_docs)
+
+    
+def faiss_clustering(input_file_path=None, file_type=None):
+    import faiss
+    from scipy.cluster.hierarchy import linkage, dendrogram
+    from scipy.cluster.hierarchy import fcluster
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import PCA
+    print("in a faiss_clustering function")
+    d = 128
+    documents, ids = [], []
+    
+    if file_type == "jsonl":
+        documents = extract_feature_list_jsonl(jsonl_file_path=input_file_path, feature_name="contents")
+        ids = extract_feature_list_jsonl(jsonl_file_path=input_file_path, feature_name="id")
+    elif file_type=="tsv":
+        documents = extract_feature_list_tsv(tsv_file_path=input_file_path, col_number=1)
+        ids = extract_feature_list_tsv(tsv_file_path=input_file_path, col_number=0)
+    print(f"Number of documents: {len(documents)}")
+    print(f"Number of ids: {len(ids)}")
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = embedding_model.encode(documents).astype(np.float16)
+    # embeddings = embedding_model.encode(documents[0:4000])
     
     # reduce the dimensionality with PCA
     d_original = embeddings.shape[1]
@@ -215,8 +304,8 @@ def faiss_clustering():
     reduced_embeddings = pca.fit_transform(embeddings)
     print("Reduced embeddings shape:", reduced_embeddings.shape)
     
-    index = faiss.IndexFlatL2(d_reduced)
-    index.add(reduced_embeddings)
+    # index = faiss.IndexFlatL2(d_reduced)
+    # index.add(reduced_embeddings)
     
     n_clusters = 10
     kmeans = faiss.Kmeans(d_reduced, n_clusters, niter=20, verbose=True)
@@ -225,13 +314,48 @@ def faiss_clustering():
     
     clustered_docs = {i: [] for i in range(n_clusters)}
     
-    for doc_id, cluster_id in zip(ids[:100], cluster_assignments):
+    # for doc_id, cluster_id in zip(ids[:100], cluster_assignments):
+    for doc_id, cluster_id in zip(ids, cluster_assignments):
         clustered_docs[cluster_id].append(doc_id)
         
     print("Clustered documents:", clustered_docs)
-    cluster_similarity_distribution(reduced_embeddings= reduced_embeddings, cluster_id=0, cluster_assignments=cluster_assignments)
+    # cluster_similarity_distribution_pairwise(reduced_embeddings= reduced_embeddings, cluster_id=0, cluster_assignments=cluster_assignments)
     
+def compute_pairwise_similarities_in_batches(embeddings, batch_size=1000):
+    import numpy as np
+    from scipy.spatial.distance import cosine
+    n = len(embeddings)
+    similarity_scores = []
+    
+    for i in range(0, n, batch_size):
+        for j in range(i+1, n, batch_size):
+            batch1 = embeddings[i:i+batch_size]
+            batch2 = embeddings[j:j+batch_size]
+            similarities = 1 - np.array([[cosine(a,b)for b in batch2] for a in batch1])
+            similarity_scores.extend(similarities.flatten())
+            
+    return np.array(similarity_scores)
+
+def cluster_similarity_distribution_pairwise(reduced_embeddings=None, cluster_id=None, cluster_assignments=None):
+    cluster_embeddings = reduced_embeddings[cluster_id == cluster_assignments]
+    
+    if len(cluster_embeddings) > 1:
+        similarity_scores = compute_pairwise_similarities_in_batches(cluster_embeddings)
+        print(f"Cluster {cluster_id} - Similarity Distribution:")
+        print(f" - Mean: {similarity_scores.mean()}")
+        print(f" - Median: {np.median(similarity_scores)}")
+        print(f" - Max: {similarity_scores.max()}")
+        print(f" - Min: {similarity_scores.min()}")
+        print(f" - 75th Percentile: {np.percentile(similarity_scores, 75)}")
+        print(f" - 90th Percentile: {np.percentile(similarity_scores, 90)}")
+        print(f" - 95th Percentile: {np.percentile(similarity_scores, 95)}")
+        print(f" - 99th Percentile: {np.percentile(similarity_scores, 99)}")
+    else:
+        print(f"Cluster {cluster_id} - Similarity Distribution: Not enough documents to compute pairwise similarities.")
+
 def cluster_similarity_distribution(reduced_embeddings=None, cluster_id=None, cluster_assignments=None):
+    #this similarity distribution computation is using full similarity matrix
+    reduced_embeddings = reduced_embeddings.astype(np.float16)
     cluster_embeddings = reduced_embeddings[cluster_id == cluster_assignments]
 
     if len(cluster_embeddings) > 1:
@@ -270,8 +394,8 @@ def hierarchical_faiss_clustering_and_topic_extraction():
     d = 128  # Reduced embedding dimension
     n_clusters = 100000  # Number of clusters
     index = faiss.IndexIVFPQ(faiss.IndexFlatL2(d), d, n_clusters, 16, 8)
-    documents = extract_feature_list(content_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
-    ids = extract_feature_list(id_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
+    documents = extract_feature_list_jsonl(content_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
+    ids = extract_feature_list_jsonl(id_doc="True", jsonl_file_path="/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl")
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
     embeddings = embedding_model.encode(documents[0:4000])
     print("the embeddings shape", embeddings.shape)
@@ -325,8 +449,51 @@ def hierarchical_faiss_clustering_and_topic_extraction():
     #     for doc in docs[:3]:  # Display top 3 docs per cluster
     #         print(f"   - {doc[:10]}...")  # Document preview
 
-def kmeans_faiss_clustering_and_topic_extraction():
-    pass
+def hashing_clustering():
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from datasketch import MinHash, MinHashLSH
+    import numpy as np
+
+    # Sample document collection
+    documents = [
+        "The quick brown fox jumps over the lazy dog.",
+        "A fast brown fox leaps over a sleepy dog.",
+        "The history of natural language processing is fascinating.",
+        "Artificial intelligence is a rapidly evolving field.",
+        "Machine learning powers many applications in AI.",
+        "Foxes are quick and dogs are usually lazy."
+    ]
+
+    # Step 1: Convert documents to TF-IDF vectors
+    vectorizer = TfidfVectorizer(stop_words='english')
+    tfidf_matrix = vectorizer.fit_transform(documents)
+
+    # Step 2: Create MinHash signatures for each document
+    def create_minhash_vector(vector, num_perm=128):
+        """Convert a sparse TF-IDF vector to a MinHash signature."""
+        minhash = MinHash(num_perm=num_perm)
+        for idx in vector.nonzero()[1]:  # Extract non-zero indices
+            minhash.update(str(idx).encode('utf-8'))
+        return minhash
+
+    minhashes = [create_minhash_vector(tfidf_matrix[i]) for i in range(tfidf_matrix.shape[0])]
+
+    # Step 3: Create an LSH index
+    lsh = MinHashLSH(threshold=0.5, num_perm=128)  # Set threshold for similarity
+    for i, minhash in enumerate(minhashes):
+        lsh.insert(f"doc_{i}", minhash)
+
+    # Step 4: Query similar documents
+    clusters = {}
+    for i, minhash in enumerate(minhashes):
+        similar_docs = lsh.query(minhash)
+        clusters[f"doc_{i}"] = similar_docs
+
+    # Display clustering results
+    print("Document Clusters:")
+    for doc, cluster in clusters.items():
+        print(f"{doc}: {cluster}")
+
     
 def extract_keywords(docs, top_n=5):
     #using tfidf weights to extract topic for each cluster
@@ -397,7 +564,10 @@ def main():
     # directory_path = '/ivi/ilps/datasets/clueweb22/disk1/txt/en'
     # detect_topic_tags(directory_path)
     
-    faiss_clustering()
+    # faiss_clustering(input_file_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/msmarco-docs-id-contents.jsonl", file_type="jsonl")
+    # faiss_clustering(input_file_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-passage/collection.tsv", file_type="tsv")
+    # faiss_clustering_streaming()
+    hashing_clustering()
     #testing index reader
     # index_path = "/ivi/ilps/personal/gpoerwa/msmarco_ir2/collections/msmarco-docs/jsonl/pyserini-index"  
     # index_reader = IndexReader(index_path)
@@ -413,5 +583,11 @@ if __name__ == "__main__":
     if not hf_key:
         raise EnvironmentError("HF_KEY environment variable is not set")
     login(token=hf_key)
-    main()
+    # main()
     
+    import ir_datasets
+    dataset = ir_datasets.load('clueweb09')
+    first_doc = next(dataset.docs_iter())
+    
+    print(first_doc)
+        
